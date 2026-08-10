@@ -1,47 +1,43 @@
-import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
+import { createClient } from '@supabase/supabase-js';
 
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-export function chunkDocument(content: string, strategy: 'semantic' | 'fixed' | 'recursive', chunkSize = 1000) {
+// Chunking strategies
+export function chunkText(text: string, strategy: 'fixed' | 'recursive' | 'semantic' = 'fixed', chunkSize = 500) {
   try {
     switch (strategy) {
-      case 'fixed':
-        return fixedChunking(content, chunkSize);
-      case 'recursive':
-        return recursiveChunking(content, chunkSize);
-      case 'semantic':
-      default:
-        return semanticChunking(content);
+      case 'fixed': return fixedChunking(text, chunkSize);
+      case 'recursive': return recursiveChunking(text, chunkSize);
+      case 'semantic': return semanticChunking(text, chunkSize);
+      default: return fixedChunking(text, chunkSize);
     }
   } catch (error: any) {
     throw new Error(`Chunking error: ${error?.message || 'Unknown error'}`);
   }
 }
 
-function fixedChunking(content: string, size: number) {
-  const chunks = [];
-  for (let i = 0; i < content.length; i += size) {
-    chunks.push(content.slice(i, i + size));
+function fixedChunking(text: string, size: number): string[] {
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += size) {
+    chunks.push(text.slice(i, i + size));
   }
   return chunks;
 }
 
-function recursiveChunking(content: string, size: number) {
+function recursiveChunking(text: string, size: number): string[] {
   const separators = ['\n\n', '\n', '. ', ' '];
-  return chunkWithSeparators(content, size, separators);
+  return recursiveSplit(text, size, separators);
 }
 
-function chunkWithSeparators(content: string, size: number, separators: string[]): string[] {
-  if (content.length <= size) return [content];
-
-  const sep = separators[0] || '';
-  const parts = content.split(sep);
+function recursiveSplit(text: string, size: number, separators: string[]): string[] {
+  if (text.length <= size) return [text];
+  const sep = separators[0] || ' ';
+  const parts = text.split(sep);
   const chunks: string[] = [];
   let current = '';
 
@@ -57,86 +53,94 @@ function chunkWithSeparators(content: string, size: number, separators: string[]
   return chunks;
 }
 
-function semanticChunking(content: string) {
-  const paragraphs = content.split('\n\n');
+function semanticChunking(text: string, size: number): string[] {
+  const sentences = text.split(/(?<=[.!?])\s+/);
   const chunks: string[] = [];
   let current = '';
 
-  for (const para of paragraphs) {
-    if ((current + '\n\n' + para).length > 1000 && current) {
+  for (const sentence of sentences) {
+    if ((current + ' ' + sentence).length > size && current) {
       chunks.push(current);
-      current = para;
+      current = sentence;
     } else {
-      current = current ? current + '\n\n' + para : para;
+      current = current ? current + ' ' + sentence : sentence;
     }
   }
   if (current) chunks.push(current);
   return chunks;
 }
 
-async function generateEmbedding(text: string) {
+// Generate embeddings
+export async function generateEmbedding(text: string): Promise<number[]> {
   try {
-    const res = await openai.embeddings.create({
+    const response = await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: text,
     });
-    return res.data[0].embedding;
+    return response.data[0].embedding;
   } catch (error: any) {
-    throw new Error(`Embedding error: ${error?.status || 500} - ${error?.message || 'Unknown error'}`);
+    throw new Error(`Embedding error: ${error?.message || 'Unknown error'}`);
   }
 }
 
-export async function storeChunks(chunks: string[], metadata: any = {}) {
+// Store chunks with embeddings
+export async function storeChunks(chunks: string[], metadata?: Record<string, any>) {
   try {
-    const stored = [];
+    const results: any[] = [];
     for (const chunk of chunks) {
       const embedding = await generateEmbedding(chunk);
       const { data, error } = await supabase
-        .from('rag_documents')
+        .from('documents')
         .insert({ content: chunk, embedding, metadata })
         .select()
         .single();
       if (error) throw error;
-      stored.push(data);
+      results.push(data);
     }
-    return stored;
+    return results;
   } catch (error: any) {
-    throw new Error(`Storage error: ${error?.message || 'Unknown error'}`);
+    throw new Error(`Store chunks error: ${error?.message || 'Unknown error'}`);
   }
 }
 
+// Hybrid search (vector + keyword)
 export async function hybridSearch(query: string, limit = 5) {
   try {
-    const embedding = await generateEmbedding(query);
+    const queryEmbedding = await generateEmbedding(query);
 
-    const { data: semanticResults, error: semanticError } = await supabase.rpc('match_rag_documents', {
-      query_embedding: embedding,
-      match_threshold: 0.7,
+    const { data: vectorResults, error: vectorError } = await supabase.rpc('match_documents', {
+      query_embedding: queryEmbedding,
       match_count: limit,
     });
 
-    if (semanticError) throw semanticError;
+    if (vectorError) throw vectorError;
 
     const { data: keywordResults, error: keywordError } = await supabase
-      .from('rag_documents')
+      .from('documents')
       .select('*')
-      .textSearch('content', query)
+      .ilike('content', `%${query}%`)
       .limit(limit);
 
     if (keywordError) throw keywordError;
 
-    const allResults = [...(semanticResults || []), ...(keywordResults || [])];
-    const unique = Array.from(new Map(allResults.map(r => [r.id, r])).values());
-    return unique.slice(0, limit);
+    const seen = new Set();
+    const merged = [...(vectorResults || []), ...(keywordResults || [])].filter((item: any) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+
+    return merged.slice(0, limit);
   } catch (error: any) {
-    throw new Error(`Search error: ${error?.message || 'Unknown error'}`);
+    throw new Error(`Hybrid search error: ${error?.message || 'Unknown error'}`);
   }
 }
 
-export async function ragQuery(question: string) {
+// RAG query with context
+export async function ragQuery(question: string, contextLimit = 3) {
   try {
-    const docs = await hybridSearch(question, 3);
-    const context = docs.map((d: any) => d.content).join('\n\n');
+    const results = await hybridSearch(question, contextLimit);
+    const context = results.map((r: any) => r.content).join('\n\n');
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4-turbo-preview',
@@ -148,9 +152,123 @@ export async function ragQuery(question: string) {
 
     return {
       answer: response.choices[0].message.content,
-      sources: docs.map((d: any) => ({ id: d.id, content: d.content.substring(0, 100) })),
+      sources: results,
+      context,
     };
   } catch (error: any) {
     throw new Error(`RAG query error: ${error?.message || 'Unknown error'}`);
+  }
+}
+
+// Query expansion
+export async function expandQuery(query: string): Promise<string[]> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4-turbo-preview',
+      messages: [
+        { role: 'system', content: 'Generate 3 alternative queries that would find similar information.' },
+        { role: 'user', content: query },
+      ],
+    });
+
+    const expanded = response.choices[0].message.content?.split('\n').filter(q => q.trim()) || [];
+    return [query, ...expanded];
+  } catch (error: any) {
+    throw new Error(`Expand query error: ${error?.message || 'Unknown error'}`);
+  }
+}
+
+// Context compression
+export async function compressContext(context: string, maxLength = 500): Promise<string> {
+  try {
+    if (context.length <= maxLength) return context;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4-turbo-preview',
+      messages: [
+        { role: 'system', content: `Compress this context to under ${maxLength} characters while keeping key information.` },
+        { role: 'user', content: context },
+      ],
+    });
+
+    return response.choices[0].message.content || context;
+  } catch (error: any) {
+    throw new Error(`Compress context error: ${error?.message || 'Unknown error'}`);
+  }
+}
+
+// Reranker
+export async function rerank(query: string, documents: string[], topK = 3) {
+  try {
+    const scored = await Promise.all(
+      documents.map(async (doc) => {
+        const response = await openai.chat.completions.create({
+          model: 'gpt-4-turbo-preview',
+          messages: [
+            { role: 'system', content: 'Rate relevance 0-10.' },
+            { role: 'user', content: `Query: ${query}\nDocument: ${doc}` },
+          ],
+        });
+        const score = parseInt(response.choices[0].message.content || '0') / 10;
+        return { document: doc, score };
+      })
+    );
+
+    return scored.sort((a, b) => b.score - a.score).slice(0, topK);
+  } catch (error: any) {
+    throw new Error(`Rerank error: ${error?.message || 'Unknown error'}`);
+  }
+}
+
+// Full pipeline
+export async function fullRAGPipeline(documents: string[], question: string) {
+  try {
+    // Chunk documents
+    const allChunks = documents.flatMap(doc => chunkText(doc, 'recursive'));
+
+    // Store chunks
+    await storeChunks(allChunks);
+
+    // Expand query
+    const expandedQueries = await expandQuery(question);
+
+    // Search with expanded queries
+    let allResults: any[] = [];
+    for (const query of expandedQueries) {
+      const results = await hybridSearch(query, 3);
+      allResults.push(...results);
+    }
+
+    // Deduplicate
+    const seen = new Set();
+    allResults = allResults.filter((r: any) => {
+      if (seen.has(r.id)) return false;
+      seen.add(r.id);
+      return true;
+    });
+
+    // Rerank
+    const ranked = await rerank(question, allResults.map((r: any) => r.content), 3);
+
+    // Compress context
+    const context = await compressContext(ranked.map(r => r.document).join('\n\n'));
+
+    // Generate answer
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4-turbo-preview',
+      messages: [
+        { role: 'system', content: `Answer based on this context:\n${context}` },
+        { role: 'user', content: question },
+      ],
+    });
+
+    return {
+      answer: response.choices[0].message.content,
+      sources: ranked,
+      chunksProcessed: allChunks.length,
+      queriesExpanded: expandedQueries.length,
+    };
+  } catch (error: any) {
+    throw new Error(`Full RAG pipeline error: ${error?.message || 'Unknown error'}`);
   }
 }
