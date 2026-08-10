@@ -8,16 +8,19 @@ const supabase = createClient(
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Document chunking strategies
 export function chunkDocument(content: string, strategy: 'semantic' | 'fixed' | 'recursive', chunkSize = 1000) {
-  switch (strategy) {
-    case 'fixed':
-      return fixedChunking(content, chunkSize);
-    case 'recursive':
-      return recursiveChunking(content, chunkSize);
-    case 'semantic':
-    default:
-      return semanticChunking(content);
+  try {
+    switch (strategy) {
+      case 'fixed':
+        return fixedChunking(content, chunkSize);
+      case 'recursive':
+        return recursiveChunking(content, chunkSize);
+      case 'semantic':
+      default:
+        return semanticChunking(content);
+    }
+  } catch (error: any) {
+    throw new Error(`Chunking error: ${error?.message || 'Unknown error'}`);
   }
 }
 
@@ -71,67 +74,83 @@ function semanticChunking(content: string) {
   return chunks;
 }
 
-// Generate embeddings
 async function generateEmbedding(text: string) {
-  const res = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: text,
-  });
-  return res.data[0].embedding;
-}
-
-// Store chunks with embeddings
-export async function storeChunks(chunks: string[], metadata: any = {}) {
-  const stored = [];
-  for (const chunk of chunks) {
-    const embedding = await generateEmbedding(chunk);
-    const { data, error } = await supabase
-      .from('rag_documents')
-      .insert({ content: chunk, embedding, metadata })
-      .select()
-      .single();
-    if (!error) stored.push(data);
+  try {
+    const res = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: text,
+    });
+    return res.data[0].embedding;
+  } catch (error: any) {
+    throw new Error(`Embedding error: ${error?.status || 500} - ${error?.message || 'Unknown error'}`);
   }
-  return stored;
 }
 
-// Hybrid search (semantic + keyword)
+export async function storeChunks(chunks: string[], metadata: any = {}) {
+  try {
+    const stored = [];
+    for (const chunk of chunks) {
+      const embedding = await generateEmbedding(chunk);
+      const { data, error } = await supabase
+        .from('rag_documents')
+        .insert({ content: chunk, embedding, metadata })
+        .select()
+        .single();
+      if (error) throw error;
+      stored.push(data);
+    }
+    return stored;
+  } catch (error: any) {
+    throw new Error(`Storage error: ${error?.message || 'Unknown error'}`);
+  }
+}
+
 export async function hybridSearch(query: string, limit = 5) {
-  const embedding = await generateEmbedding(query);
+  try {
+    const embedding = await generateEmbedding(query);
 
-  const { data: semanticResults } = await supabase.rpc('match_rag_documents', {
-    query_embedding: embedding,
-    match_threshold: 0.7,
-    match_count: limit,
-  });
+    const { data: semanticResults, error: semanticError } = await supabase.rpc('match_rag_documents', {
+      query_embedding: embedding,
+      match_threshold: 0.7,
+      match_count: limit,
+    });
 
-  const { data: keywordResults } = await supabase
-    .from('rag_documents')
-    .select('*')
-    .textSearch('content', query)
-    .limit(limit);
+    if (semanticError) throw semanticError;
 
-  // Merge and deduplicate
-  const allResults = [...(semanticResults || []), ...(keywordResults || [])];
-  const unique = Array.from(new Map(allResults.map(r => [r.id, r])).values());
-  return unique.slice(0, limit);
+    const { data: keywordResults, error: keywordError } = await supabase
+      .from('rag_documents')
+      .select('*')
+      .textSearch('content', query)
+      .limit(limit);
+
+    if (keywordError) throw keywordError;
+
+    const allResults = [...(semanticResults || []), ...(keywordResults || [])];
+    const unique = Array.from(new Map(allResults.map(r => [r.id, r])).values());
+    return unique.slice(0, limit);
+  } catch (error: any) {
+    throw new Error(`Search error: ${error?.message || 'Unknown error'}`);
+  }
 }
 
-// RAG query with reranking
 export async function ragQuery(question: string) {
-  const docs = await hybridSearch(question, 3);
-  const context = docs.map((d: any) => d.content).join('\n\n');
+  try {
+    const docs = await hybridSearch(question, 3);
+    const context = docs.map((d: any) => d.content).join('\n\n');
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4-turbo-preview',
-    messages: [
-      { role: 'system', content: `Answer based on this context:\n${context}` },
-      { role: 'user', content: question },
-    ],
-  });
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4-turbo-preview',
+      messages: [
+        { role: 'system', content: `Answer based on this context:\n${context}` },
+        { role: 'user', content: question },
+      ],
+    });
 
-  return {
-    answer: response.choices[0].message.content,
-    sources: docs.map((d: any) => ({ id: d.id, content: d.content.substring(0, 100) })),
-  };
+    return {
+      answer: response.choices[0].message.content,
+      sources: docs.map((d: any) => ({ id: d.id, content: d.content.substring(0, 100) })),
+    };
+  } catch (error: any) {
+    throw new Error(`RAG query error: ${error?.message || 'Unknown error'}`);
+  }
 }
